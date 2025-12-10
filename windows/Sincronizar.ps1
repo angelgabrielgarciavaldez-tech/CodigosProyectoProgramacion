@@ -1,0 +1,119 @@
+param(
+    [string]$MySQLPath="C:\ProgramData\chocolatey\bin\mysql.exe",
+    [string]$DBHost="127.0.0.1",
+    [string]$DBUser="ProyectoW",
+    [string]$DBPass="123456789",
+    [string]$DBName="Proyecto"
+)
+
+function Query-MySQL { param([string]$Query) & $MySQLPath -h $DBHost -u $DBUser -p"$DBPass" -D $DBName -sN -e "$Query" 2>$null }
+function Update-EstadoWindows { param([string]$Usuario,[string]$Estado,[string]$ErrorMessage)
+    $errorSql = if ($ErrorMessage) { "'$ErrorMessage'" } else { "NULL" }
+    $Query=@"
+UPDATE usuarios_sync
+SET windows_estado='$Estado', windows_error=$errorSql, ultima_actualizacion=NOW()
+WHERE username='$Usuario';
+"@
+    Query-MySQL $Query | Out-Null
+}
+
+Write-Host "===== SINCRONIZACION WINDOWS =====" -ForegroundColor Cyan
+
+# Obtener pendientes
+$QueryPendientes="SELECT id, username, accion FROM pendientes_sync WHERE destino='WINDOWS' AND procesado=0;"
+$Acciones=Query-MySQL $QueryPendientes
+if ($null -eq $Acciones -or $Acciones.Trim() -eq "") { Write-Host "No hay acciones pendientes." -ForegroundColor Gray; exit 0 }
+if ($Acciones -is [string]) { $Acciones=$Acciones -split "`r?`n" }
+
+foreach ($accion in $Acciones) {
+    if ([string]::IsNullOrWhiteSpace($accion)) { continue }
+    $cols=$accion -split "`t"; $ID=$cols[0]; $Usuario=$cols[1]; $Operacion=$cols[2].ToUpper()
+    Write-Host "`n=== Procesando: $Operacion | Usuario: $Usuario ===" -ForegroundColor Yellow
+    $success=$false; $errorMessage=$null
+
+    try {
+        # Traer contraseña y posible nuevo nombre
+        if ($Operacion -ne "ELIMINAR") {
+            $plainPassword = Query-MySQL "SELECT password_hash FROM usuarios_sync WHERE username='$Usuario' ORDER BY id DESC LIMIT 1;"
+        }
+        if ($Operacion -eq "MODIFICAR" -or $Operacion -eq "RENOMBRAR") {
+            $NuevoNombre = Query-MySQL "SELECT nuevo_nombre FROM usuarios_sync WHERE username='$Usuario' ORDER BY id DESC LIMIT 1;"
+        }
+
+        switch ($Operacion) {
+            "CREAR" {
+                if (-not (Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue)) {
+                    if (-not $plainPassword) { throw "No hay password en DB" }
+                    $Password=ConvertTo-SecureString $plainPassword -AsPlainText -Force
+                    New-LocalUser -Name $Usuario -Password $Password -AccountNeverExpires
+                    $GroupName=(Get-LocalGroup | Where-Object {$_.Name -match "Users"}).Name
+                    if ($GroupName) { Add-LocalGroupMember -Group $GroupName -Member $Usuario }
+                    Write-Host " - Usuario creado"
+                } else { Write-Host " - Usuario ya existe" }
+                $success=$true
+            }
+            "MODIFICAR" {
+                $exists=Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue
+                if (-not $exists) {
+                    # Crear si no existe
+                    if (-not $plainPassword) { throw "No hay password en DB" }
+                    $Password=ConvertTo-SecureString $plainPassword -AsPlainText -Force
+                    New-LocalUser -Name $Usuario -Password $Password -AccountNeverExpires
+                    $GroupName=(Get-LocalGroup | Where-Object {$_.Name -match "Users"}).Name
+                    if ($GroupName) { Add-LocalGroupMember -Group $GroupName -Member $Usuario }
+                    Write-Host " - Usuario creado automáticamente"
+                } else {
+                    # Actualizar contraseña
+                    if (-not $plainPassword) { throw "No hay password en DB" }
+                    $Password=ConvertTo-SecureString $plainPassword -AsPlainText -Force
+                    Set-LocalUser -Name $Usuario -Password $Password
+                    Write-Host " - Password actualizado"
+                }
+
+                # Renombrar si hay nuevo nombre
+                # Renombrar si hay nuevo nombre válido
+if ($NuevoNombre -and $NuevoNombre.Trim() -ne "" -and $NuevoNombre -ne $Usuario) {
+    Rename-LocalUser -Name $Usuario -NewName $NuevoNombre
+    Write-Host " - Usuario renombrado a $NuevoNombre"
+    $Usuario = $NuevoNombre
+} else {
+    Write-Host " - No hay nuevo nombre para renombrar" -ForegroundColor Gray
+}
+
+
+                $success=$true
+            }
+            "ELIMINAR" {
+                $exists=Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue
+                if ($exists) { Remove-LocalUser -Name $Usuario; Write-Host " - Usuario eliminado" }
+                $sshFolder="C:\Users\$Usuario\.ssh"
+                if (Test-Path $sshFolder) { Remove-Item $sshFolder -Recurse -Force; Write-Host " - Carpeta SSH eliminada" }
+                $success=$true
+            }
+            "RENOMBRAR" {
+                $exists=Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue
+                if ($exists -and $NuevoNombre) { Rename-LocalUser -Name $Usuario -NewName $NuevoNombre; Write-Host " - Usuario renombrado a $NuevoNombre"; $Usuario=$NuevoNombre; $success=$true }
+                else { throw "Usuario no existe o nombre nuevo inválido" }
+            }
+            default { throw "Operacion desconocida: $Operacion" }
+        }
+    } catch {
+        $success=$false
+        $errorMessage=$_.Exception.Message
+        Write-Host "[ERROR] $errorMessage" -ForegroundColor Red
+    }
+
+    # Actualizar estado en BD
+    if ($success) {
+        Update-EstadoWindows -Usuario $Usuario -Estado "ok" -ErrorMessage $null
+        Query-MySQL "UPDATE pendientes_sync SET procesado=1 WHERE id=$ID" | Out-Null
+        Write-Host " - BD Actualizada" -ForegroundColor Green
+    } else {
+        Update-EstadoWindows -Usuario $Usuario -Estado "error" -ErrorMessage $errorMessage
+        Write-Host " - Registrado error en BD" -ForegroundColor Yellow
+    }
+
+    Write-Host "------------------------------------"
+}
+
+Write-Host "Sincronizacion Windows finalizada." -ForegroundColor Cyan
